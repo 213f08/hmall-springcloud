@@ -1,0 +1,7 @@
+# 复制本文件为 application-local.yaml 并填入你自己的值（application-local.yaml 不入库）
+hm:
+  db:
+    host: <虚拟机/MySQL 地址>
+    pw: <你的 MySQL 密码>
+  jwt:
+    pw: <生成 hmall.jks 时用的密码>

@@ -1,0 +1,15 @@
+target/
+logs/
+.idea/
+*.iml
+.vscode/
+.qoder-credits/
+*.log
+
+# 大体积课件数据（35M 商品数据 + nginx 绿色包，非本项目代码）
+resources/hm-item.sql
+resources/hmall-nginx/
+
+# 本地凭据，不入库（克隆后复制 application-local.example.yaml 为 application-local.yaml 并填写）
+application-local.yaml
+*.jks
