@@ -1,0 +1,72 @@
+[
+  {
+    "id": "item-service",
+    "uri": "lb://item-service",
+    "predicates": [
+      {
+        "name": "Path",
+        "args": {
+          "_genkey_0": "/items/**"
+        }
+      }
+    ],
+    "filters": [],
+    "order": 0
+  },
+  {
+    "id": "cart-service",
+    "uri": "lb://cart-service",
+    "predicates": [
+      {
+        "name": "Path",
+        "args": {
+          "_genkey_0": "/carts/**"
+        }
+      }
+    ],
+    "filters": [],
+    "order": 0
+  },
+  {
+    "id": "user-service",
+    "uri": "lb://user-service",
+    "predicates": [
+      {
+        "name": "Path",
+        "args": {
+          "_genkey_0": "/users/**"
+        }
+      }
+    ],
+    "filters": [],
+    "order": 0
+  },
+  {
+    "id": "trade-service",
+    "uri": "lb://trade-service",
+    "predicates": [
+      {
+        "name": "Path",
+        "args": {
+          "_genkey_0": "/orders/**"
+        }
+      }
+    ],
+    "filters": [],
+    "order": 0
+  },
+  {
+    "id": "pay-service",
+    "uri": "lb://pay-service",
+    "predicates": [
+      {
+        "name": "Path",
+        "args": {
+          "_genkey_0": "/pay-orders/**"
+        }
+      }
+    ],
+    "filters": [],
+    "order": 0
+  }
+]

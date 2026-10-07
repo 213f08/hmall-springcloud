@@ -11,7 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 // hmall.jks 加载验证：用 keystore 里的私钥签一个 RS256 token，再解析回 userId
-@SpringBootTest
+@SpringBootTest(properties = "spring.cloud.nacos.discovery.register-enabled=false")
 public class UserJwtToolTest {
 
     @Autowired

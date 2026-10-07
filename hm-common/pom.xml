@@ -32,6 +32,12 @@
             <artifactId>spring-webmvc</artifactId>
             <scope>provided</scope>
         </dependency>
+        <!--OpenFeign：hm-common 里的请求头透传拦截器要用，provided 不强加给使用方-->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-openfeign</artifactId>
+            <scope>provided</scope>
+        </dependency>
         <!--日志-->
         <dependency>
             <groupId>org.springframework.boot</groupId>

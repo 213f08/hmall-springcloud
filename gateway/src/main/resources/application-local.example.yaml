@@ -1,0 +1,5 @@
+# 复制本文件为 application-local.yaml 并填入你自己的值（application-local.yaml 不入库）
+# 需先用 keytool 生成 hmall.jks，此处填生成时用的口令
+hm:
+  jwt:
+    pw: <生成 hmall.jks 时用的密码>

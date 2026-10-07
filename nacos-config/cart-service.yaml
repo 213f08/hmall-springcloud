@@ -1,0 +1,3 @@
+hm:
+  cart:
+    maxItems: 10 # 购物车商品条目上限，修改后无需重启 cart-service

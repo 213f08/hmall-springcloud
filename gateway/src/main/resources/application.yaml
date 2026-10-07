@@ -1,0 +1,16 @@
+server:
+  port: 8080
+# 路由配置不写在这里，改由 Nacos 的 gateway.json 管理（见 DynamicRouteLoader），修改后无需重启
+hm:
+  jwt:
+    location: classpath:hmall.jks
+    alias: hmall
+    password: ${hm.jwt.pw}
+    tokenTTL: 30m
+  auth:
+    # 白名单，命中就不做登录校验
+    excludePaths:
+      - /users/login
+      - /items/**
+      - /search/**
+      - /favicon.ico
