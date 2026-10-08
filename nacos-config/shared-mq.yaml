@@ -1,0 +1,7 @@
+spring:
+  rabbitmq:
+    host: localhost # 课程里是虚拟机 IP 192.168.150.101，本机是 docker 起的 rabbitmq 容器
+    port: 5672 # 端口
+    virtual-host: /hmall # 虚拟主机
+    username: hmall # 用户名
+    password: 123 # 密码

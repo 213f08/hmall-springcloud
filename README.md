@@ -1,6 +1,6 @@
 # hmall — 单体拆微服务练习
 
-黑马 SpringCloud 课程 day03、day04、day05 的练手项目：把电商单体 `hm-service` 按业务边界拆成 5 个独立服务，用 Nacos 做服务注册与发现，服务间调用走 OpenFeign；配置交给 Nacos 统一管理（共享配置 + 热更新 + 网关动态路由）；cart-service 接入 Sentinel 做限流、线程隔离、fallback 和熔断；下单链路接入 Seata，XA 和 AT 两种模式的全局回滚都实测过。
+黑马 SpringCloud 课程 day03 ~ day06 的练手项目：把电商单体 `hm-service` 按业务边界拆成 5 个独立服务，用 Nacos 做服务注册与发现，服务间调用走 OpenFeign；配置交给 Nacos 统一管理（共享配置 + 热更新 + 网关动态路由）；cart-service 接入 Sentinel 做限流、线程隔离、fallback 和熔断；下单链路接入 Seata，XA 和 AT 两种模式的全局回滚都实测过；day06 把「支付成功通知交易」「下单通知清购物车」两条同步 Feign 调用改成了 RabbitMQ 异步消息。
 
 ## 模块
 
@@ -20,12 +20,13 @@
 ```
 cart  ──▶ item   （查商品）
 trade ──▶ item   （查商品、扣库存）
-trade ──▶ cart   （下单后清购物车）
 pay   ──▶ user   （扣余额）
-pay   ──▶ trade  （标记订单已支付）
+
+trade  ··▶ cart   （下单后清购物车，RabbitMQ 异步）
+pay    ··▶ trade  （支付成功改订单状态，RabbitMQ 异步）
 ```
 
-调用方只写服务名（`@FeignClient(value = "item-service")`），地址由 Nacos 解析，没有硬编码 IP。
+实线是 OpenFeign 同步调用，只写服务名（`@FeignClient(value = "item-service")`），地址由 Nacos 解析，没有硬编码 IP；虚线（··▶）是 day06 改成 RabbitMQ 异步通知的两条。
 
 ## 环境
 
@@ -33,6 +34,7 @@ pay   ──▶ trade  （标记订单已支付）
 - MySQL 8：容器 `sky-mysql`，导入 `resources/` 下的 `hm-item.sql`（数据量大，未入库，需从课件另取）、`hm-cart.sql`、`hm-user.sql`、`hm-pay.sql`、`hm-trade.sql`
 - Nacos 2.1.0 standalone，元数据存 MySQL（建库脚本 `resources/nacos.sql`，配置见 `resources/nacos/custom.env`）
 - Seata TC 1.5.2，事务状态也存 MySQL（建表脚本 `resources/seata-tc.sql`）；AT 模式还要给参与事务的业务库各建一张 `undo_log`（`resources/seata-at.sql`）。两个脚本都是课程资料里的原文件
+- RabbitMQ 3.8（课件 `day06-MQ入门/资料/mq.tar`，带 management 插件），虚拟主机 `/hmall`，账号 `hmall`
 
 ## 配置
 
@@ -60,6 +62,7 @@ keytool -genkeypair -alias hmall -keyalg RSA -keypass <密码> -keystore hmall.j
 | `shared-log.yaml` | 日志级别与格式 |
 | `shared-swagger.yaml` | knife4j 文档配置 |
 | `shared-seata.yaml` | Seata TC 地址、事务组、XA/AT 模式开关 |
+| `shared-mq.yaml` | RabbitMQ 连接信息（host/port/vhost/账号） |
 | `cart-service.yaml` | cart-service 自己的业务配置（`hm.cart.maxItems`） |
 | `gateway.json` | 网关路由表 |
 
@@ -237,6 +240,74 @@ XA 的 `lockKey` 是 null（锁在数据库手里，TC 不掺和），AT 会把�
 
 `global_table.status`：2=Committing、4=Rollbacking、8=AsyncCommitting。事务结束后记录不会立刻消失，TC 的 `RetryRollbacking` / `RetryCommitting` 定时任务会再来一趟确认并清掉（实测一分钟左右自己就没了），不用手工删。
 
+## 异步消息（RabbitMQ）
+
+「支付成功后更新订单状态」「下单成功后清理购物车」原来是同步 Feign 调用：下游挂了或慢了，上游跟着一起卡。改成发消息之后，支付服务只管把「支付成功」扔出去就返回，交易服务按自己的节奏消费。
+
+### 环境
+
+镜像是课件 `day06-MQ入门/资料/mq.tar` 里的 `rabbitmq:3.8-management`：
+
+```bash
+docker load -i mq.tar
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 \
+  -e RABBITMQ_DEFAULT_USER=hmall -e RABBITMQ_DEFAULT_PASS=123 rabbitmq:3.8-management
+# Git Bash 会把 /hmall 变成 C:/Program Files/Git/hmall，必须加 MSYS_NO_PATHCONV=1
+MSYS_NO_PATHCONV=1 docker exec rabbitmq rabbitmqctl add_vhost /hmall
+MSYS_NO_PATHCONV=1 docker exec rabbitmq rabbitmqctl set_permissions -p /hmall hmall ".*" ".*" ".*"
+# 管理台 http://localhost:15672 ，账号密码 hmall / 123
+```
+
+### 拓扑
+
+| 交换机 | 类型 | 队列 | BindingKey | 生产者 → 消费者 |
+| --- | --- | --- | --- | --- |
+| `pay.direct` | direct | `trade.pay.success.queue` | `pay.success` | pay-service → trade-service |
+| `trade.topic` | topic | `cart.clear.queue` | `order.create` | trade-service → cart-service |
+
+队列、交换机、绑定关系都由消费者侧 `@RabbitListener` 上的 `@QueueBinding` 在服务启动时自动声明，控制台不用手点。`@Exchange` 不写 `type` 时默认是 direct，topic 必须显式写 `type = ExchangeTypes.TOPIC`。
+
+### 配置
+
+连接信息放在 Nacos 的 `shared-mq.yaml`，pay / trade / cart 的 `bootstrap.yaml` 各引一条。
+
+消息序列化换成了 JSON：hm-common 的 `AmqpConfig` 注册 `Jackson2JsonMessageConverter`。不换的话默认是 JDK 序列化（`ObjectOutputStream`），控制台里看到的是一堆乱码字节，而且消费方必须有同一个类才能反序列化。
+
+### 业务改造
+
+- **pay-service**：`tryPayOrderByBalance` 把 `orderClient.markOrderPaySuccess(...)` 换成 `rabbitTemplate.convertAndSend("pay.direct", "pay.success", bizOrderNo)`。发送失败只记 error 日志、不回滚——钱已经扣了、支付单已经成功了，不能因为一条通知没发出去就把它退回去。
+- **trade-service**：`PayStatusListener` 监听 `trade.pay.success.queue`，收到就 `markOrderPaySuccess(orderId)`。
+- **trade-service**：`createOrder` 把 `cartClient.removeByItemIds(...)` 换成往 `trade.topic` 发 `order.create` 消息，而且放在全局事务的**最后一步**——前面任何一步失败（比如库存不足触发 Seata 回滚）根本走不到发送，不会出现「订单回滚了、购物车却清了」。
+- **cart-service**：`CartClearListener` 监听 `cart.clear.queue`。
+
+跨服务的消息体两边各留一份字段同名的 DTO（`ClearCartDTO`），不共享 jar。消费侧反序列化时消息头里的 `__TypeId__` 是发送方的类名，在 cart-service 里根本不存在，`DefaultClassMapper` 找不到就退回用监听方法参数上声明的类型——所以只要字段名对得上就行。
+
+### 登录用户透传
+
+同步调用有 `user-info` 请求头，异步消息没有。最直白的做法是把 userId 写进消息体，消费者再手动塞回 `UserContext`，但这样编程体验和 HTTP 那条链路不一致（业务代码本来都是 `UserContext.getUser()`）。
+
+hm-common 的 `MqUserContextConfig` 把这一步收掉了，业务侧无感知：
+
+- **发送端**：给 `RabbitTemplate` 挂一个 `BeforePublishPostProcessor`，把 `UserContext.getUser()` 写进消息头 `user-info`，和 Feign 那条链路用同一个头名。
+- **接收端**：覆盖 `rabbitListenerContainerFactory`，在 advice chain 里从消息头取出用户塞进 `UserContext`，方法返回后 `removeUser()`——消费者线程是复用的，不清理下一条消息就串号了。
+
+于是消息体里的 `userId` 字段删掉了，`cartService.removeByItemIds` 一行没改。
+
+踩到两个坑：
+
+- 这个自动配置必须加 `@AutoConfigureBefore(RabbitAutoConfiguration.class)`，否则 Boot 自己的 `rabbitListenerContainerFactory` 先注册，你这份会被静默顶掉，advice 根本不跑。
+- advice 拦到的方法是 `AbstractMessageListenerContainer$ContainerDelegate.invokeListener(Channel, Object)`，**Message 在第二个参数**，不是第一个。别按下标取，遍历 `getArguments()` 找 `instanceof Message` 更稳。
+
+### 实测
+
+| 场景 | 结果 |
+| --- | --- |
+| 余额支付异步通知 | `POST /pay-orders/{id}` 返回 200；`pay_order.status` 1→3、余额扣掉 135800、`order.status` 1→2 并写入 `pay_time`；trade-service 日志里 `收到支付成功消息` 打在 `[ntContainer#0-1]` 线程上，是消费者线程不是 HTTP 线程 |
+| 下单异步清购物车 | `POST /orders` 返回订单号；订单和明细落库、库存 -1；`cart` 里 user_id=1 的行由 `CartClearListener` 删掉，cart-service 全程没有任何 HTTP 入站记录（Feign 那条路已经拆掉了） |
+| 消息头带用户 | 停掉消费者后抓一条原始消息：`headers: {"__TypeId__": "com.hmall.trade.domain.dto.ClearCartDTO", "user-info": "1"}`，payload 只有 `{"itemIds":[100000006163]}`；消费者起来后购物车按 user_id 精确删除成功 |
+| MQ 配置来自 Nacos | 服务启动日志的 `Located property source` 里有 `bootstrapProperties-shared-mq.yaml,DEFAULT_GROUP`；`CachingConnectionFactory` 连上 `amqp://hmall@127.0.0.1:5672//hmall` |
+| 队列/交换机自动声明 | 服务一起来，`/hmall` 里自动出现 `pay.direct`、`trade.pay.success.queue`、`trade.topic`、`cart.clear.queue` 和两条绑定 |
+
 ## 启动
 
 MyBatis-Plus 3.4.3 在 JDK 21 上必须加 `--add-opens`，否则启动报错：
@@ -249,7 +320,7 @@ java --add-opens java.base/java.lang.invoke=ALL-UNNAMED \
      -jar item-service/target/item-service.jar --spring.profiles.active=local
 ```
 
-要跑下单链路还得先起 Seata TC，再起 item / cart / trade，而且这三个服务的 `--add-opens` 要用上面 Seata 那一节的完整一组，只加 `java.lang.invoke` 会在 `GlobalTransactionScanner` 那里挂掉。
+要跑下单链路还得先起 Seata TC 和 RabbitMQ 容器，再起 item / cart / trade，而且这三个服务的 `--add-opens` 要用上面 Seata 那一节的完整一组，只加 `java.lang.invoke` 会在 `GlobalTransactionScanner` 那里挂掉。
 
 IDEA 里直接跑各模块的启动类也可以（VM options 加同上参数）。注册是否成功看 Nacos 控制台，或：
 
@@ -273,5 +344,6 @@ mvn -B test -pl user-service  -Dtest=UserJwtToolTest  -DargLine="--add-opens jav
 ## 已知问题
 
 - **item-service 的异常响应格式和其它服务不一致**：它的启动类在 `com.hmall.item`，默认扫描漏掉了兄弟包 `com.hmall.common.advice`，业务异常返回的是 Spring 原生 `{"timestamp","status","error","path"}`，不是统一的 `{"code","msg","data"}`。补 `@ComponentScan("com.hmall")` 即可。
-- **分布式事务只覆盖了下单链路。** pay-service 的 `pay→user 扣余额`、`pay→trade 标记已支付` 还是本地 `@Transactional`，跨进程的部分同样回滚不了。按课程进度这块留到后面。
+- **`pay → user 扣余额` 还是同步 Feign**，和支付单更新在同一个本地事务里，这块没问题；`pay → trade 改订单状态` 已经改成 MQ，但**消息可靠性还没做**：发送失败只记 error 日志，没有 confirm 机制、没有失败重试、也没有本地消息表，真丢了订单就会一直停在未支付，需要人工或补偿任务兜。属于 day07 的内容。
+- **`下单清购物车` 改成 MQ 之后不受 Seata 管辖**，是最终一致：只要消息发出去了，`createOrder` 就不会因为它失败而回滚，购物车那边如果一直消费不掉，商品会留在购物车里。
 - **Sentinel 规则不持久化**，服务和控制台一重启就没了。

@@ -3,8 +3,8 @@ package com.hmall.trade.service.impl;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmall.common.exception.BadRequestException;
 import com.hmall.common.utils.UserContext;
-import com.hmall.trade.client.CartClient;
 import com.hmall.trade.client.ItemClient;
+import com.hmall.trade.domain.dto.ClearCartDTO;
 import com.hmall.trade.domain.dto.ItemDTO;
 import com.hmall.trade.domain.dto.OrderDetailDTO;
 import com.hmall.trade.domain.dto.OrderFormDTO;
@@ -15,6 +15,8 @@ import com.hmall.trade.service.IOrderDetailService;
 import com.hmall.trade.service.IOrderService;
 import io.seata.spring.annotation.GlobalTransactional;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -32,13 +34,14 @@ import java.util.stream.Collectors;
  * @author 虎哥
  * @since 2023-05-05
  */
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements IOrderService {
 
     private final ItemClient itemClient;
     private final IOrderDetailService detailService;
-    private final CartClient cartClient;
+    private final RabbitTemplate rabbitTemplate;
 
     @Override
     @GlobalTransactional
@@ -73,15 +76,25 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         List<OrderDetail> details = buildDetails(order.getId(), items, itemNumMap);
         detailService.saveBatch(details);
 
-        // 3.清理购物车商品
-        cartClient.removeByItemIds(itemIds);
-
-        // 4.扣减库存
+        // 3.扣减库存
         try {
             itemClient.deductStock(detailDTOS);
         } catch (Exception e) {
             throw new RuntimeException("库存不足！");
         }
+
+        // 4.通知购物车服务清理商品
+        // 放在全局事务的最后一步：前面任何一步失败都不会发出这条消息；
+        // 发送本身失败也只记日志，不能因为一条通知把已经成功的订单回滚掉。
+        // 登录用户不用写进消息体，MqUserContextConfig 会自动放进消息头
+        ClearCartDTO clearCartDTO = new ClearCartDTO();
+        clearCartDTO.setItemIds(itemIds);
+        try {
+            rabbitTemplate.convertAndSend("trade.topic", "order.create", clearCartDTO);
+        } catch (Exception e) {
+            log.error("清理购物车的消息发送失败，订单id：{}，用户id：{}", order.getId(), order.getUserId(), e);
+        }
+
         return order.getId();
     }
 

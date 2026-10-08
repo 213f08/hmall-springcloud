@@ -2,4 +2,6 @@ org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
   com.hmall.common.config.MyBatisConfig,\
   com.hmall.common.config.JsonConfig,\
   com.hmall.common.config.DefaultFeignConfig,\
+  com.hmall.common.config.AmqpConfig,\
+  com.hmall.common.mq.MqUserContextConfig,\
   com.hmall.common.mvc.MvcConfig
