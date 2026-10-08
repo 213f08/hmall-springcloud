@@ -1,0 +1,15 @@
+seata:
+  registry: # 注册中心的配置，微服务根据这些信息去注册中心获取TC服务地址
+    type: nacos # 注册中心类型 nacos
+    nacos:
+      server-addr: ${spring.cloud.nacos.server-addr} # 直接复用 bootstrap.yaml 里已经写过的地址
+      namespace: ""
+      group: DEFAULT_GROUP
+      application: seata-server # seata服务名称
+      username: nacos
+      password: nacos
+  tx-service-group: hmall # 事务组名称
+  service:
+    vgroup-mapping: # 事务组与tc集群的映射关系
+      hmall: "default"
+  data-source-proxy-mode: AT # 数据源代理模式：XA 或 AT。改了要重启服务，不是热更新

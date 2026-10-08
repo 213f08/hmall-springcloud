@@ -13,3 +13,5 @@ resources/hmall-nginx/
 # 本地凭据，不入库（克隆后复制 application-local.example.yaml 为 application-local.yaml 并填写）
 application-local.yaml
 *.jks
+# Seata TC 的容器配置里带 mysql 密码，同样只入库 example
+seata-server/application.yml

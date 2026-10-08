@@ -12,3 +12,4 @@ spring:
           - dataId: shared-jdbc.yaml # 共享 jdbc、mybatis-plus 配置
           - dataId: shared-log.yaml # 共享日志配置
           - dataId: shared-swagger.yaml # 共享 knife4j 配置
+          - dataId: shared-seata.yaml # 共享 seata 分布式事务配置

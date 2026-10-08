@@ -1,5 +1,14 @@
 server:
   port: 8082
+spring:
+  cloud:
+    sentinel:
+      transport:
+        dashboard: localhost:8090 # sentinel 控制台地址
+      http-method-specify: true # 簇点资源名加请求方式前缀，避免 Restful 路径重名
+feign:
+  sentinel:
+    enabled: true # 把 FeignClient 也作为簇点资源，才能对它做线程隔离和熔断
 hm:
   db:
     name: hm-cart # 数据库名，供 shared-jdbc.yaml 拼接 url
