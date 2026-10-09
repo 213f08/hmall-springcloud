@@ -17,4 +17,9 @@ public interface IOrderService extends IService<Order> {
     Long createOrder(OrderFormDTO orderFormDTO);
 
     void markOrderPaySuccess(Long orderId);
+
+    /**
+     * 关闭超时未支付的订单，并归还已扣减的库存
+     */
+    void cancelOrder(Long orderId);
 }

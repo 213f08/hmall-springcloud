@@ -1,5 +1,7 @@
 package com.hmall.common.config;
 
+import com.hmall.common.mq.RabbitMqHelper;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
@@ -18,5 +20,10 @@ public class AmqpConfig {
     @Bean
     public MessageConverter messageConverter() {
         return new Jackson2JsonMessageConverter();
+    }
+
+    @Bean
+    public RabbitMqHelper rabbitMqHelper(RabbitTemplate rabbitTemplate) {
+        return new RabbitMqHelper(rabbitTemplate);
     }
 }

@@ -16,7 +16,7 @@ publish() { # $1=dataId $2=file $3=type
   echo "$1 -> $r"
 }
 
-for f in shared-*.yaml cart-service.yaml; do
+for f in shared-*.yaml cart-service.yaml trade-service.yaml; do
   [ -f "$f" ] && publish "$f" "$f" yaml
 done
 [ -f gateway.json ] && publish gateway.json gateway.json json

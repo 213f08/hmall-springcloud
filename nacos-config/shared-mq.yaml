@@ -5,3 +5,18 @@ spring:
     virtual-host: /hmall # 虚拟主机
     username: hmall # 用户名
     password: 123 # 密码
+    publisher-confirm-type: correlated # 开启生产者确认，RabbitMqHelper.sendMessageWithConfirm 依赖它
+    template:
+      retry:
+        enabled: true # 发送时连接类异常自动重试
+        initial-interval: 1000ms # 第一次失败后等 1 秒
+        max-attempts: 3 # 最多 3 次
+        multiplier: 1 # 下次等待时长 = 上次 * 该倍数
+    listener:
+      simple:
+        retry:
+          enabled: true # 消费者处理失败时重试；同时 hm-common 的 MqConsumeErrorAutoConfiguration 会生效
+          initial-interval: 1000ms
+          multiplier: 1
+          max-attempts: 3
+          stateless: true # 无状态重试；业务里带事务时改成 false

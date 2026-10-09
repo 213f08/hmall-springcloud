@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.toolkit.IdWorker;
 import com.baomidou.mybatisplus.core.toolkit.StringUtils;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmall.common.exception.BizIllegalException;
+import com.hmall.common.mq.RabbitMqHelper;
 import com.hmall.common.utils.BeanUtils;
 import com.hmall.common.utils.UserContext;
 import com.hmall.pay.client.UserClient;
@@ -15,7 +16,6 @@ import com.hmall.pay.mapper.PayOrderMapper;
 import com.hmall.pay.service.IPayOrderService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -36,7 +36,7 @@ public class PayOrderServiceImpl extends ServiceImpl<PayOrderMapper, PayOrder> i
 
     private final UserClient userClient;
 
-    private final RabbitTemplate rabbitTemplate;
+    private final RabbitMqHelper mqHelper;
 
     @Override
     public String applyPayOrder(PayApplyDTO applyDTO) {
@@ -65,9 +65,10 @@ public class PayOrderServiceImpl extends ServiceImpl<PayOrderMapper, PayOrder> i
         }
         // 5.修改订单状态：不再同步调用交易服务的接口，改为发一条消息异步通知
         try {
-            rabbitTemplate.convertAndSend("pay.direct", "pay.success", po.getBizOrderNo());
+            // 带确认发送：broker 没回 ack 就重试 3 次，全失败也只记日志——
+            // 钱已经扣了，不能因为一条通知没发出去把支付单退回去，兜底交给交易服务的超时检查
+            mqHelper.sendMessageWithConfirm("pay.direct", "pay.success", po.getBizOrderNo(), 3);
         } catch (Exception e) {
-            // 消息发送失败不回滚支付单：钱已经扣了，订单状态可以靠人工或补偿任务再同步
             log.error("支付成功的消息发送失败，支付单id：{}，交易单id：{}", po.getId(), po.getBizOrderNo(), e);
         }
     }

@@ -4,4 +4,5 @@ org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
   com.hmall.common.config.DefaultFeignConfig,\
   com.hmall.common.config.AmqpConfig,\
   com.hmall.common.mq.MqUserContextConfig,\
+  com.hmall.common.mq.MqConsumeErrorAutoConfiguration,\
   com.hmall.common.mvc.MvcConfig

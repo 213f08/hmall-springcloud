@@ -1,6 +1,6 @@
 # hmall — 单体拆微服务练习
 
-黑马 SpringCloud 课程 day03 ~ day06 的练手项目：把电商单体 `hm-service` 按业务边界拆成 5 个独立服务，用 Nacos 做服务注册与发现，服务间调用走 OpenFeign；配置交给 Nacos 统一管理（共享配置 + 热更新 + 网关动态路由）；cart-service 接入 Sentinel 做限流、线程隔离、fallback 和熔断；下单链路接入 Seata，XA 和 AT 两种模式的全局回滚都实测过；day06 把「支付成功通知交易」「下单通知清购物车」两条同步 Feign 调用改成了 RabbitMQ 异步消息。
+黑马 SpringCloud 课程 day03 ~ day07 的练手项目：把电商单体 `hm-service` 按业务边界拆成 5 个独立服务，用 Nacos 做服务注册与发现，服务间调用走 OpenFeign；配置交给 Nacos 统一管理（共享配置 + 热更新 + 网关动态路由）；cart-service 接入 Sentinel 做限流、线程隔离、fallback 和熔断；下单链路接入 Seata，XA 和 AT 两种模式的全局回滚都实测过；day06 把「支付成功通知交易」「下单通知清购物车」两条同步 Feign 调用改成了 RabbitMQ 异步消息；day07 用延迟消息做订单超时关单，并把收发包、失败重投封装成工具。
 
 ## 模块
 
@@ -13,20 +13,22 @@
 | pay-service | 8084 | hm-pay | 支付单 |
 | trade-service | 8085 | hm-trade | 订单 |
 
-`hm-common` 是公共模块（统一响应 `R`、异常、`UserContext`、MyBatis/Jackson 配置）；`hm-service` 是拆分前的单体，保留作对照。
+`hm-common` 是公共模块（统一响应 `R`、异常、`UserContext`、MyBatis/Jackson 配置、MQ 收发工具）；`hm-api` 是跨服务的 Feign 接口与 DTO（目前只有 `PayClient`）；`hm-service` 是拆分前的单体，保留作对照。
 
 ## 服务间调用
 
 ```
 cart  ──▶ item   （查商品）
-trade ──▶ item   （查商品、扣库存）
+trade ──▶ item   （查商品、扣库存、还库存）
 pay   ──▶ user   （扣余额）
+trade ──▶ pay    （查支付流水，超时检查用）
 
 trade  ··▶ cart   （下单后清购物车，RabbitMQ 异步）
 pay    ··▶ trade  （支付成功改订单状态，RabbitMQ 异步）
+trade  ··▶ trade  （下单后自检支付状态，RabbitMQ 延迟消息）
 ```
 
-实线是 OpenFeign 同步调用，只写服务名（`@FeignClient(value = "item-service")`），地址由 Nacos 解析，没有硬编码 IP；虚线（··▶）是 day06 改成 RabbitMQ 异步通知的两条。
+实线是 OpenFeign 同步调用，只写服务名（`@FeignClient(value = "item-service")`），地址由 Nacos 解析，没有硬编码 IP；虚线（··▶）是 day06 改成 RabbitMQ 异步通知的两条。`trade → pay` 是 day07 超时检查时查支付流水用的接口，定义在公共模块 `hm-api` 里。
 
 ## 环境
 
@@ -62,8 +64,9 @@ keytool -genkeypair -alias hmall -keyalg RSA -keypass <密码> -keystore hmall.j
 | `shared-log.yaml` | 日志级别与格式 |
 | `shared-swagger.yaml` | knife4j 文档配置 |
 | `shared-seata.yaml` | Seata TC 地址、事务组、XA/AT 模式开关 |
-| `shared-mq.yaml` | RabbitMQ 连接信息（host/port/vhost/账号） |
+| `shared-mq.yaml` | RabbitMQ 连接信息 + 生产者确认 + 生产/消费两端重试 |
 | `cart-service.yaml` | cart-service 自己的业务配置（`hm.cart.maxItems`） |
+| `trade-service.yaml` | trade-service 自己的业务配置（`hm.trade.orderDelay` 超时关单时长） |
 | `gateway.json` | 网关路由表 |
 
 这些文件的副本在 `nacos-config/` 目录，Nacos 装好后一键发布：
@@ -275,7 +278,7 @@ MSYS_NO_PATHCONV=1 docker exec rabbitmq rabbitmqctl set_permissions -p /hmall hm
 
 ### 业务改造
 
-- **pay-service**：`tryPayOrderByBalance` 把 `orderClient.markOrderPaySuccess(...)` 换成 `rabbitTemplate.convertAndSend("pay.direct", "pay.success", bizOrderNo)`。发送失败只记 error 日志、不回滚——钱已经扣了、支付单已经成功了，不能因为一条通知没发出去就把它退回去。
+- **pay-service**：`tryPayOrderByBalance` 把 `orderClient.markOrderPaySuccess(...)` 换成发一条 `pay.direct` / `pay.success` 消息（day07 起走 `mqHelper.sendMessageWithConfirm`，见下文）。发送失败只记 error 日志、不回滚——钱已经扣了、支付单已经成功了，不能因为一条通知没发出去就把它退回去。
 - **trade-service**：`PayStatusListener` 监听 `trade.pay.success.queue`，收到就 `markOrderPaySuccess(orderId)`。
 - **trade-service**：`createOrder` 把 `cartClient.removeByItemIds(...)` 换成往 `trade.topic` 发 `order.create` 消息，而且放在全局事务的**最后一步**——前面任何一步失败（比如库存不足触发 Seata 回滚）根本走不到发送，不会出现「订单回滚了、购物车却清了」。
 - **cart-service**：`CartClearListener` 监听 `cart.clear.queue`。
@@ -289,14 +292,14 @@ MSYS_NO_PATHCONV=1 docker exec rabbitmq rabbitmqctl set_permissions -p /hmall hm
 hm-common 的 `MqUserContextConfig` 把这一步收掉了，业务侧无感知：
 
 - **发送端**：给 `RabbitTemplate` 挂一个 `BeforePublishPostProcessor`，把 `UserContext.getUser()` 写进消息头 `user-info`，和 Feign 那条链路用同一个头名。
-- **接收端**：覆盖 `rabbitListenerContainerFactory`，在 advice chain 里从消息头取出用户塞进 `UserContext`，方法返回后 `removeUser()`——消费者线程是复用的，不清理下一条消息就串号了。
+- **接收端**：消息刚收到、还没转成对象时（`afterReceivePostProcessors`），把头里的用户塞回 `UserContext`；头里没有就 `removeUser()`——消费者线程是复用的，不清理下一条消息就串号了。
 
 于是消息体里的 `userId` 字段删掉了，`cartService.removeByItemIds` 一行没改。
 
-踩到两个坑：
+这里有两个坑，都是踩过之后才改对的：
 
-- 这个自动配置必须加 `@AutoConfigureBefore(RabbitAutoConfiguration.class)`，否则 Boot 自己的 `rabbitListenerContainerFactory` 先注册，你这份会被静默顶掉，advice 根本不跑。
-- advice 拦到的方法是 `AbstractMessageListenerContainer$ContainerDelegate.invokeListener(Channel, Object)`，**Message 在第二个参数**，不是第一个。别按下标取，遍历 `getArguments()` 找 `instanceof Message` 更稳。
+- 覆盖 `rabbitListenerContainerFactory` 的自动配置必须加 `@AutoConfigureBefore(RabbitAutoConfiguration.class)`，否则 Boot 自己那份先注册，你这份被静默顶掉，钩子根本不跑（表现是 `UserContext` 一直是 null、删除影响 0 行、一点报错都没有）。
+- **不能自己去 `setAdviceChain`**。day06 最初就是用 advice chain 挂的，但 advice chain 正是 Boot 放消费者重试拦截器的那个字段，手动一覆盖，`spring.rabbitmq.listener.simple.retry.*` 就全失效了（day07 开重试时才发现）。正确做法：先调 Boot 的 `SimpleRabbitListenerContainerFactoryConfigurer.configure(factory, cf)` 把它该配的都配好，再只追加 `afterReceivePostProcessors`——它和 advice chain 是两个互不相干的字段，加它不会顶掉重试。
 
 ### 实测
 
@@ -307,6 +310,123 @@ hm-common 的 `MqUserContextConfig` 把这一步收掉了，业务侧无感知�
 | 消息头带用户 | 停掉消费者后抓一条原始消息：`headers: {"__TypeId__": "com.hmall.trade.domain.dto.ClearCartDTO", "user-info": "1"}`，payload 只有 `{"itemIds":[100000006163]}`；消费者起来后购物车按 user_id 精确删除成功 |
 | MQ 配置来自 Nacos | 服务启动日志的 `Located property source` 里有 `bootstrapProperties-shared-mq.yaml,DEFAULT_GROUP`；`CachingConnectionFactory` 连上 `amqp://hmall@127.0.0.1:5672//hmall` |
 | 队列/交换机自动声明 | 服务一起来，`/hmall` 里自动出现 `pay.direct`、`trade.pay.success.queue`、`trade.topic`、`cart.clear.queue` 和两条绑定 |
+
+### 延迟消息插件
+
+RabbitMQ 自己只有「消息 TTL + 死信」这种绕路的延时方案。装上官方插件 `rabbitmq_delayed_message_exchange` 后，可以声明一种新类型 `x-delayed-message` 的交换机：消息先存在**交换机内部**，到点才按 `x-delayed-type` 指定的规则路由给队列。
+
+插件副本存在 `resources/rabbitmq_delayed_message_exchange-3.8.17.8f537ac.ez`（50 KB；243 MB 的 `mq.tar` 不入库），装法：
+
+```bash
+docker cp resources/rabbitmq_delayed_message_exchange-3.8.17.8f537ac.ez \
+  rabbitmq:/opt/rabbitmq/plugins/
+docker exec rabbitmq rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+docker exec rabbitmq rabbitmq-plugins list | grep delayed    # 期望 [E*] rabbitmq_delayed_message_exchange
+```
+
+Spring 侧声明交换机时要带上类型和 `x-delayed-type` 参数，发送时给消息头写 `x-delay`（毫秒）：
+
+```java
+@Exchange(name = "delay.test.exchange", type = "x-delayed-message",
+        arguments = @Argument(key = "x-delayed-type", value = "direct"))
+
+rabbitTemplate.convertAndSend("delay.test.exchange", "delay.test", body,
+        msg -> { msg.getMessageProperties().setHeader("x-delay", 8000); return msg; });
+```
+
+实测（用管理台 API 发一条 `x-delay: 8000`）：
+
+- 声明 `x-delayed-message` 类型交换机的请求返回 201，说明插件确实注册上了。
+- 发送那一步响应是 `{"routed":false}` —— **这不是失败**。此刻消息被插件暂存在交换机里，确实还没路由给任何队列；8 秒后队列的 `messages_ready` 才从 0 变 1，取出来正文就是刚发的那条。
+- 取出来时消息头显示 `x-delay: -8000`，是插件释放消息时改写的内部标记，不是配置写错了。
+
+**注意**：插件文件放在容器的可写层里，`docker stop` / `docker start` 不会丢，但 `docker rm` 重建容器就没了，要重新执行上面三步。
+
+## 超时关单与 MQ 工具（day07）
+
+### 超时订单
+
+下单 15 分钟内没付款就该关单、把库存还回去。做法是下单时发一条**延迟消息**，到点再回头查这笔单子付了没有：
+
+```
+trade-service 下单 ──发延迟消息(x-delay)──▶ trade.delay.direct(x-delayed-message)
+                                                  │ 到点
+                                                  ▼
+                                          trade.delay.order.queue
+                                                  │
+                            ┌─────────────────────┴────────────────────┐
+                            ▼ 本地订单 status=1（还没付）                ▼ status!=1
+                    调 pay-service 查支付流水                      直接 return
+                            │  ┌──────────────┴──────────────┐
+                       status=3 │                        其它/查不到
+                            ▼  ▼                          ▼
+                  markOrderPaySuccess               cancelOrder（关单 + 还库存）
+```
+
+拓扑常量集中在 `trade/constants/MQConstants`：交换机 `trade.delay.direct`、队列 `trade.delay.order.queue`、RoutingKey `delay.order.query`。
+
+延迟时长是**配置项** `hm.trade.orderDelay`（`TradeProperties`，默认 15 分钟，值在 Nacos 的 `trade-service.yaml`）。做成配置而不是写死，是因为本地要验证 15 分钟的逻辑不能真等 15 分钟——把 Nacos 改成 `10s` 保存，`@RefreshScope` 立刻生效，不用改代码也不用重启；验证完改回 `15m` 即可。支持 `15m` / `10s` 这类写法（`@DurationUnit(MINUTES)`，裸数字按分钟）。
+
+跨服务查支付流水走新加的 **`hm-api`** 模块：`PayOrderDTO` + `PayClient`，pay-service 侧对应 `GET /pay-orders/biz/{id}`。
+
+两个设计要点：
+
+- **`PayClient` 故意不配 `fallbackFactory`**。降级返回 null 会让调用方分不清两种完全不同的情况：「确实没有支付流水」= 真没付，该关单；「支付服务此刻连不上」= 未知，**不该关单**。课程代码里那版 fallback 会把后者也判成前者，从而误关已付款的订单。去掉之后查询失败会抛异常 → 走消费者重试 → 耗尽后落错误队列，订单原地不动等人处理。这也顺带撤掉了 day07 为这个 fallback 才加的 trade-service Sentinel 依赖（没有降级需求就不必引）。
+- `@FeignClient` 定义在 `com.hmall.api.client`，各服务启动类都在 `com.hmall` 包下，所以 `@EnableFeignClients` 不用改扫描路径就能发现它。
+
+### cancelOrder 的幂等设计
+
+关单要动两个库（hm-trade 改状态、hm-item 还库存），重复消费或并发时最容易出现**还两次库存**。做法是把状态判断写进 UPDATE 的 where 条件，当成幂等闸门：
+
+```java
+boolean cancelled = lambdaUpdate()
+        .set(Order::getStatus, 5)          // 5 = 交易取消，订单关闭
+        .eq(Order::getId, orderId)
+        .eq(Order::getStatus, 1)           // 只有「未付款」才关得掉，第二次影响 0 行
+        .update();
+if (!cancelled) { return; }
+```
+
+方法上还要加 `@GlobalTransactional`：恢复库存是远程调用，一旦失败，第 1 步的关单必须一起回滚，订单留在未付款状态——否则订单已经关闭，重试进来会被幂等闸门挡掉，**库存就永久丢了**。实测这一条真的踩到了（下面第 3 行）。
+
+### MQ 工具封装
+
+业务代码不再直接注入 `RabbitTemplate`，统一走 hm-common 的 `RabbitMqHelper`，三个方法对应三档可靠性：
+
+| 方法 | 用途 | 可靠性 |
+| --- | --- | --- |
+| `sendMessage` | 清购物车这类「丢了影响小」的通知 | 发完就走，不管 broker 收没收到 |
+| `sendDelayMessage` | 超时检查 | 同上，需要延迟插件 |
+| `sendMessageWithConfirm` | 支付成功这类不能丢的消息 | 等 broker 回 ack，不回就重试，耗尽抛异常 |
+
+第 3 种依赖 Nacos `shared-mq.yaml` 里的 `spring.rabbitmq.publisher-confirm-type: correlated`。
+
+消费失败的处理放在 `MqConsumeErrorAutoConfiguration`，条件是 `spring.rabbitmq.listener.simple.retry.enabled=true`：
+
+- 声明 `error.direct`（direct 类型）
+- 队列名 = **微服务名 + `error.queue`**，如 `trade-serviceerror.queue`、`cart-serviceerror.queue`
+- 绑定的 RoutingKey = 微服务名
+- 声明 `RepublishMessageRecoverer` → Boot 会自动把它接进重试拦截器，重试耗尽后失败消息连同异常栈一起投到本服务的错误队列，不再无限重入队刷日志
+
+这套配置（confirm + 生产者重试 + 消费者重试）全在 Nacos 的 `shared-mq.yaml` 里，各服务本地没有一份重复的 MQ 配置。
+
+错误队列还有一个配套消费者 `MqErrorQueueListener`（`@RabbitListener(queues = "#{errorQueue.name}")`，同一个自动配置里注册），把失败消息连同原交换机、原 RoutingKey、异常信息、消息体打成一整条 ERROR 日志——目的是让失败**可见、可报警**，而不是消息静静堆在队列里没人看。它内部吞掉一切异常：这段代码自己也挂在「失败重试 + 重投错误队列」的拦截器链上，一旦抛出就会被再投回 `error.direct`，形成无限循环刷日志。
+
+注意这只是可见性，**不是自动补偿**：消息一被消费就离队了，要自动重放还得靠幂等的补偿任务或本地消息表。不想自动消费掉的话，去掉那个 Bean，消息就会留在队列里用管理台查。
+
+### 实测
+
+| 场景 | 结果 |
+| --- | --- |
+| 超时未支付自动关单 | `orderDelay` 临时调成 10s 后下单不付款，10 秒后订单 `status` 1→5、`stock` 回到原值；监听日志在 `[ntContainer#0-1]` 线程 |
+| 延迟时长可配置 + 热更新 | 配置为默认 `15m` 时下单，等 22 秒订单仍是 `status=1`、监听器一条日志都没有（证明不是写死的 10 秒）；把 Nacos 的 `trade-service.yaml` 改成 `10s` 保存，**不重启 trade-service**，下一笔订单 10 秒后正常关单 |
+| 已支付不被误关 | 下单后立刻余额支付，延迟消息到点时日志打「订单不存在或已不是未付款状态」，订单保持 `status=2`、库存不还原 |
+| **支付服务不可用时不误关** | 下单后立刻杀掉 pay-service → 延迟检查时 `GET http://pay-service/pay-orders/biz/{id}` 连接被拒 → 重试耗尽落错误队列 → **订单保持 `status=1`**（既没被关掉也没被补记），等人工处理。这是去掉 fallback 之后才有的正确行为 |
+| 恢复库存失败时不出脏数据 | 下单后把 item-service 杀掉 → 延迟消息触发 `cancelOrder` → 远程还库存连接被拒 → **订单 status 仍是 1、库存没动**（`@GlobalTransactional` 把关单回滚了），消息得以重试 |
+| 消费者重试 + 错误队列 | 同一笔订单的「延迟消息检查」日志出现 3 次（间隔 1 秒），随后 `MqErrorQueueListener` 在 `[ntContainer#2-1]` 线程打出 ERROR：`【MQ消费失败已重试耗尽，需人工介入】原交换机=trade.delay.direct，原RoutingKey=delay.order.query，异常=…executing GET http://pay-service/…`；堆栈里有 `RetryOperationsInterceptor`，说明 Boot 的重试确实挂在链上 |
+| 错误队列自动声明 | 三个服务各自建出并消费自己的 `pay-serviceerror.queue` / `trade-serviceerror.queue` / `cart-serviceerror.queue`，绑定 key 就是服务名 |
+| 生产者确认 | 带确认发送支付成功消息，接口 `time_total=1.4s`、日志里 0 条「未收到 broker 确认」告警 —— ack 第一次就回来了，没有白等超时 |
+| 队列自动声明 | 服务一起来，`/hmall` 里自动多出 `trade.delay.direct`（类型 `x-delayed-message`）、`trade.delay.order.queue`、`error.direct`、`trade-serviceerror.queue`、`cart-serviceerror.queue` 及对应绑定 |
 
 ## 启动
 
@@ -344,6 +464,9 @@ mvn -B test -pl user-service  -Dtest=UserJwtToolTest  -DargLine="--add-opens jav
 ## 已知问题
 
 - **item-service 的异常响应格式和其它服务不一致**：它的启动类在 `com.hmall.item`，默认扫描漏掉了兄弟包 `com.hmall.common.advice`，业务异常返回的是 Spring 原生 `{"timestamp","status","error","path"}`，不是统一的 `{"code","msg","data"}`。补 `@ComponentScan("com.hmall")` 即可。
-- **`pay → user 扣余额` 还是同步 Feign**，和支付单更新在同一个本地事务里，这块没问题；`pay → trade 改订单状态` 已经改成 MQ，但**消息可靠性还没做**：发送失败只记 error 日志，没有 confirm 机制、没有失败重试、也没有本地消息表，真丢了订单就会一直停在未支付，需要人工或补偿任务兜。属于 day07 的内容。
-- **`下单清购物车` 改成 MQ 之后不受 Seata 管辖**，是最终一致：只要消息发出去了，`createOrder` 就不会因为它失败而回滚，购物车那边如果一直消费不掉，商品会留在购物车里。
+- **`pay → user 扣余额` 还是同步 Feign**，和支付单更新在同一个本地事务里，这块没问题。
+- **「每下一单就往 MQ 塞一条 15~30 分钟的消息」这个方案本身有代价**：高并发时消息堆积给 MQ 压力大，且大多数订单 1 分钟内就付了却要在队列里白等几十分钟——更省资源的做法是定时任务扫表（课程 PPT 最后一页自己也指出了这点），本项目没做。
+- **错误队列的消费者只把失败打成 ERROR 日志，没有自动重放**：消息一出队就没了，要自动补偿还得靠幂等的补偿任务或本地消息表。
+- **下单清购物车不受 Seata 管辖**（day06 改成 MQ 之后）：只要消息发出去了，`createOrder` 就不会因为它失败而回滚，购物车消费不掉的话商品会留着，属于最终一致。
+- **下单清购物车不受 Seata 管辖**（day06 改成 MQ 之后）：只要消息发出去了，`createOrder` 就不会因为它失败而回滚，购物车消费不掉的话商品会留着，属于最终一致。
 - **Sentinel 规则不持久化**，服务和控制台一重启就没了。

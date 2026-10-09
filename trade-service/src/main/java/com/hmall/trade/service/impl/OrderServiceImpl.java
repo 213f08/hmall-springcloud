@@ -2,8 +2,11 @@ package com.hmall.trade.service.impl;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmall.common.exception.BadRequestException;
+import com.hmall.common.mq.RabbitMqHelper;
 import com.hmall.common.utils.UserContext;
 import com.hmall.trade.client.ItemClient;
+import com.hmall.trade.config.TradeProperties;
+import com.hmall.trade.constants.MQConstants;
 import com.hmall.trade.domain.dto.ClearCartDTO;
 import com.hmall.trade.domain.dto.ItemDTO;
 import com.hmall.trade.domain.dto.OrderDetailDTO;
@@ -16,7 +19,6 @@ import com.hmall.trade.service.IOrderService;
 import io.seata.spring.annotation.GlobalTransactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -41,7 +43,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
 
     private final ItemClient itemClient;
     private final IOrderDetailService detailService;
-    private final RabbitTemplate rabbitTemplate;
+    private final RabbitMqHelper mqHelper;
+    private final TradeProperties tradeProperties;
 
     @Override
     @GlobalTransactional
@@ -90,9 +93,19 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         ClearCartDTO clearCartDTO = new ClearCartDTO();
         clearCartDTO.setItemIds(itemIds);
         try {
-            rabbitTemplate.convertAndSend("trade.topic", "order.create", clearCartDTO);
+            mqHelper.sendMessage("trade.topic", "order.create", clearCartDTO);
         } catch (Exception e) {
             log.error("清理购物车的消息发送失败，订单id：{}，用户id：{}", order.getId(), order.getUserId(), e);
+        }
+
+        // 5.发送延迟消息，到点后检查订单支付状态，超时未支付就关单还库存
+        // 延迟时长取自配置 hm.trade.orderDelay（Nacos 里改，热更新，默认 15 分钟）
+        try {
+            int delayMillis = (int) tradeProperties.getOrderDelay().toMillis();
+            mqHelper.sendDelayMessage(MQConstants.DELAY_EXCHANGE_NAME, MQConstants.DELAY_ORDER_KEY,
+                    order.getId(), delayMillis);
+        } catch (Exception e) {
+            log.error("订单延迟消息发送失败，订单id：{}", order.getId(), e);
         }
 
         return order.getId();
@@ -105,6 +118,37 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         order.setStatus(2);
         order.setPayTime(LocalDateTime.now());
         updateById(order);
+    }
+
+    @Override
+    @GlobalTransactional
+    public void cancelOrder(Long orderId) {
+        // 1.关闭订单：把「当前状态必须是未付款」写进 where 条件，当作幂等闸门。
+        //   重复消费或并发时第二次影响 0 行，直接返回，绝不会还两次库存。
+        boolean cancelled = lambdaUpdate()
+                .set(Order::getStatus, 5)
+                .eq(Order::getId, orderId)
+                .eq(Order::getStatus, 1)
+                .update();
+        if (!cancelled) {
+            log.info("订单不存在或不是未付款状态，忽略取消操作，订单id：{}", orderId);
+            return;
+        }
+        // 2.按订单明细恢复库存。加 @GlobalTransactional 是为了：远程恢复失败时，
+        //   第 1 步的关单也一起回滚，订单留在未付款状态，消息重试时才可能重新还一次库存；
+        //   否则订单已经关闭，重试进来会被幂等闸门挡掉，库存就永久丢了。
+        List<OrderDetail> details = detailService.lambdaQuery()
+                .eq(OrderDetail::getOrderId, orderId)
+                .list();
+        if (details.isEmpty()) {
+            return;
+        }
+        List<OrderDetailDTO> itemNumbers = details.stream()
+                .map(detail -> new OrderDetailDTO()
+                        .setItemId(detail.getItemId())
+                        .setNum(detail.getNum()))
+                .collect(Collectors.toList());
+        itemClient.restoreStock(itemNumbers);
     }
 
     private List<OrderDetail> buildDetails(Long orderId, List<ItemDTO> items, Map<Long, Integer> numMap) {
