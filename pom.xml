@@ -17,6 +17,7 @@
         <module>user-service</module>
         <module>pay-service</module>
         <module>trade-service</module>
+        <module>search-service</module>
         <module>gateway</module>
     </modules>
 
@@ -38,6 +39,8 @@
         <mybatis-plus.version>3.4.3</mybatis-plus.version>
         <hutool.version>5.8.11</hutool.version>
         <mysql.version>8.0.23</mysql.version>
+        <!--SpringBoot 2.7.12 的 BOM 默认管理的是 ES 7.17.10，和服务端 7.12.1 不一致会报错，覆盖掉-->
+        <elasticsearch.version>7.12.1</elasticsearch.version>
     </properties>
 
     <!-- 对依赖包进行管理 -->

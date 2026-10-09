@@ -1,0 +1,6 @@
+server:
+  port: 8086
+hm:
+  swagger:
+    title: 搜索服务接口文档 # 供 shared-swagger.yaml 使用
+    package: com.hmall.search.controller

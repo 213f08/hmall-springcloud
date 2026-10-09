@@ -68,5 +68,19 @@
     ],
     "filters": [],
     "order": 0
+  },
+  {
+    "id": "search-service",
+    "uri": "lb://search-service",
+    "predicates": [
+      {
+        "name": "Path",
+        "args": {
+          "_genkey_0": "/search/**"
+        }
+      }
+    ],
+    "filters": [],
+    "order": 0
   }
 ]

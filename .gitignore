@@ -15,3 +15,5 @@ application-local.yaml
 *.jks
 # Seata TC 的容器配置里带 mysql 密码，同样只入库 example
 seata-server/application.yml
+# docker compose 的本地密码和数据卷 id，只入库 .env.example
+docker/.env

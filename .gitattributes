@@ -1,0 +1,4 @@
+# core.autocrlf=true 会把签出的文本文件转成 CRLF，而 RabbitMQ 的 enabled_plugins 是按行解析的
+# Erlang term 文件，所以这两个必须锁 LF。
+docker/rabbitmq/enabled_plugins text eol=lf
+docker/docker-compose.yml text eol=lf

@@ -1,0 +1,121 @@
+# hmall 本地依赖环境编排：MySQL + Nacos + RabbitMQ
+#
+# 用法：
+#   cd docker
+#   cp .env.example .env        # 填密码和（可选）现有数据卷 id
+#   docker compose up -d
+#   docker compose ps           # mysql 和 rabbitmq 应该是 healthy
+#
+# 几条约定，别改：
+#   - 三个容器都用 container_name 固定成原来的名字，所以 `docker exec -it sky-mysql mysql ...`
+#     这类命令、README 里的端口、application-local.yaml 的 hm.db.host: localhost 全都不用改。
+#   - 微服务和 Seata TC 不在这里跑，它们在宿主机上（TC 用 Docker 跑会因为网段路由不到而连不上），
+#     所以 3306 / 8848 / 9848-9849 / 5672 / 15672 必须照旧映射到宿主机。
+#   - nacos 依赖 mysql 的健康检查（depends_on.condition: service_healthy）。这条是专门用来根治
+#     2026-10-09 早上那次故障的：Docker 重启后 nacos(unless-stopped) 抢在 sky-mysql(no) 之前起来，
+#     报 No DataSource set 变成僵尸——端口在听但接口返回 000，五个微服务全部启动失败。
+#     两个容器现在都是 restart=unless-stopped，加上启动顺序约束，就不会再出现那个情况。
+#   - redis7 不属于本文件。它是 8/1 那个 `sql` compose 栈的成员、苍穹外卖在用，别在这里重建它。
+#   - mysql8 也属于那个栈，已经 Exited(137) 两个月，和这里的 sky-mysql 抢同一个 3306，别误启动。
+#
+# 从「手 docker run」迁移到这份 compose 而**不丢数据**：
+#   1) 查出两个匿名卷 id：
+#        docker inspect -f '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{end}}' sky-mysql
+#        docker inspect -f '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{end}}' rabbitmq
+#   2) 填进 .env 的 MYSQL_DATA_VOLUME / RABBITMQ_DATA_VOLUME，compose 就会直接复用原卷
+#      （nacos 元数据、seata 事务表、五个业务库、/hmall 虚拟主机和队列都还在）。
+#   3) 删旧容器再拉起：
+#        docker rm -f nacos rabbitmq sky-mysql
+#        docker compose up -d
+#      ⚠️ 这一步千万别顺手 `docker volume prune`，那会把匿名卷一起删掉。
+#   不填 .env 里那两个卷名的话，compose 会新建空卷，等于换了一台干净机器：
+#   MySQL 要重新导入 resources/*.sql 和 resources/nacos.sql、resources/seata-tc.sql，
+#   RabbitMQ 要重新建 vhost（见 README「异步消息（RabbitMQ）」一节）。
+
+name: hmall-infra
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: sky-mysql
+    restart: unless-stopped
+    # 照抄原容器的启动参数，不要自己加 --default-authentication-plugin：
+    # 现有账号本来就是 caching_sha2_password，而这两个 charset 参数一丢，
+    # 中文存成 U+FFFD 的问题就会回来（这一周踩过好几次）。
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?先在 docker/.env 里填写 MySQL root 密码}
+      MYSQL_DATABASE: sky_take_out
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      # 用真实查询而不是 mysqladmin ping：ping 在 MySQL 还没准备好接受连接时也可能成功
+      test: ['CMD-SHELL', 'mysql -uroot -p"$$MYSQL_ROOT_PASSWORD" -e "SHOW DATABASES" > /dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  nacos:
+    image: nacos/nacos-server:v2.1.0-slim
+    container_name: nacos
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MODE: standalone
+      # 这个镜像里是 JDK 8 + 精简系统，没有 curl/wget/nc，所以没法做 HTTP 健康检查；
+      # 靠 depends_on mysql healthy 保证它起来时元数据库已经可用。
+      PREFER_HOST_MODE: hostname
+      SPRING_DATASOURCE_PLATFORM: mysql
+      MYSQL_SERVICE_HOST: mysql          # 走 compose 网络里的服务名，不再用 host.docker.internal
+      MYSQL_SERVICE_PORT: "3306"
+      MYSQL_SERVICE_DB_NAME: nacos
+      MYSQL_SERVICE_USER: root
+      MYSQL_SERVICE_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_SERVICE_DB_PARAM: characterEncoding=utf8&connectTimeout=1000&socketTimeout=3000&autoReconnect=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
+      NACOS_AUTH_ENABLE: "false"
+      JVM_XMS: 256m
+      JVM_XMX: 256m
+      JVM_XMN: 128m
+      TZ: Asia/Shanghai
+    ports:
+      - "8848:8848"
+      - "9848:9848"      # gRPC：客户端注册/订阅走这个端口，2.x 是 8848+1000，漏了它微服务会报
+      - "9849:9849"      # gRPC：服务端之间通信
+
+  rabbitmq:
+    image: rabbitmq:3.8-management
+    container_name: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-hmall}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-123}
+    ports:
+      - "5672:5672"
+      - "15672:15672"    # 管理台 http://localhost:15672
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      # 延迟消息插件从仓库里挂进来，这样 docker rm 重建容器也不会丢（原来只装在容器可写层里）
+      - ../resources/rabbitmq_delayed_message_exchange-3.8.17.8f537ac.ez:/opt/rabbitmq/plugins/rabbitmq_delayed_message_exchange-3.8.17.8f537ac.ez:ro
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'rabbitmq-diagnostics -q ping']
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  # .env 里填了现有匿名卷的长 id，就直接复用原数据（本机已经填好了）；
+  # 留空则用右边的默认名新建空卷 —— 卷已存在就复用，不存在就创建，不会误覆盖别的卷。
+  mysql_data:
+    name: ${MYSQL_DATA_VOLUME:-hmall-mysql-data}
+  rabbitmq_data:
+    name: ${RABBITMQ_DATA_VOLUME:-hmall-rabbitmq-data}
